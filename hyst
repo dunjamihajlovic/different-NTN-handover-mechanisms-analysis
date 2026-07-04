@@ -1,0 +1,321 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+class SimulationConfig: 
+    def __init__(self, hysteresis_dB=3.0):
+        self.calculate_interference = False 
+        self.moving_user = False  
+        self.ho_strategy = 'SNR'
+        self.ttt_seconds = 0.3 
+        self.alpha_off = 0.5  
+        self.use_hysteresis = True if hysteresis_dB > 0 else False
+        self.H_dB = hysteresis_dB            
+        self.gamma_th_dB = 3.0     # Outage prag [dB]
+
+        # Geometrija i orbita
+        self.N = 35                 
+        self.elev_min_deg = 10.0    
+        self.Re = 6371e3            
+        self.h = 600e3              
+        self.r_orbit = self.Re + self.h
+        self.konstanta_mi = 3.986e14
+
+        # Vreme simulacije
+        self.dt = 0.5          
+        
+        # Link Budget
+        self.fc = 2e9               
+        self.c = 3e8                                
+        self.lambda_ = self.c / self.fc
+        self.Pt_dBm = 35.0          
+        self.Gt_dBi = 26.0          
+        self.Gr_max_dBi = 0.0      
+        self.La = 0.5
+        
+        self.B = 10e6                
+        self.N0_dBmHz = -174.0
+        self.NF_dB = 4.0
+
+        self.noise_dBm = self.N0_dBmHz + 10 * np.log10(self.B) + self.NF_dB
+        self.noise_linear = 10 ** (self.noise_dBm / 10.0) 
+
+        # Kašnjenje (Delay) parametri
+        self.handover_penalty_seconds = 0.04  # 40 ms po handoveru
+
+    @property
+    def omega(self):
+        return np.sqrt(self.konstanta_mi / (self.r_orbit ** 3))
+
+    @property
+    def T_orbite(self): 
+        return 2 * np.pi / self.omega
+
+
+class User:
+    def __init__(self, angle_rad=0.0, radius=6371e3):
+        self.radius = radius 
+        self.v_ms = 100 / 3.6   
+        self.omega_user = self.v_ms / self.radius 
+        self.angle = angle_rad
+        self.x = radius * np.cos(angle_rad)
+        self.y = radius * np.sin(angle_rad)
+        self.ux = self.x / radius
+        self.uy = self.y / radius
+        self.position_history = {}
+
+
+class Satellite:
+    def __init__(self, sat_id, initial_theta):
+        self.id = sat_id
+        self.initial_theta = initial_theta
+        self.metrics_history = {}     
+        self.positions_history = {}   
+        self.prev_sf_LoS = None 
+        self.prev_sf_NLoS = None
+
+    def get_3gpp_rural_parameters(self, elev_deg):
+        if elev_deg <= 15.0:
+            return 0.782, 1.14, 9.7, 18.2
+        elif elev_deg <= 25.0:
+            return 0.861, 0.92, 8.8, 15.9
+        else:
+            return 0.950, 0.72, 7.5, 0.0
+
+    def update_position_and_metrics(self, t, config, user): 
+        theta_orbit = self.initial_theta + config.omega * t
+        xs = config.r_orbit * np.cos(theta_orbit)
+        ys = config.r_orbit * np.sin(theta_orbit)
+        
+        self.positions_history[t] = (xs, ys)
+        
+        dx = xs - user.x
+        dy = ys - user.y
+        d = np.sqrt(dx**2 + dy**2)
+        
+        elev_rad = np.arcsin((dx * user.ux + dy * user.uy) / d)
+        elev_deg = np.degrees(elev_rad)
+        
+        if elev_deg >= config.elev_min_deg:
+            visible = True
+            fspl_dB = 20 * np.log10(4 * np.pi * d * config.fc / config.c) 
+            pr_los, sigma_los, sigma_nlos, cl_dB = self.get_3gpp_rural_parameters(elev_deg)
+            
+            novi_sum_los = np.random.normal(0, sigma_los)
+            novi_sum_nlos = np.random.normal(0, sigma_nlos)
+            
+            rho = 0.98
+            if self.prev_sf_LoS is None or self.prev_sf_NLoS is None:
+                sf_los = novi_sum_los
+                sf_nlos = novi_sum_nlos
+            else:
+                sf_los = rho * self.prev_sf_LoS + np.sqrt(1 - rho**2) * novi_sum_los
+                sf_nlos = rho * self.prev_sf_NLoS + np.sqrt(1 - rho**2) * novi_sum_nlos
+                
+            self.prev_sf_LoS = sf_los
+            self.prev_sf_NLoS = sf_nlos
+            
+            PL_LoS = sf_los + fspl_dB
+            PL_NLoS = sf_nlos + cl_dB + fspl_dB
+            PL_tot = pr_los * PL_LoS + (1.0 - pr_los) * PL_NLoS
+            pr_dBm = config.Pt_dBm + config.Gt_dBi + config.Gr_max_dBi - PL_tot - config.La
+        else:
+            visible = False
+            pr_dBm = -np.inf
+            self.prev_sf_LoS = None
+            self.prev_sf_NLoS = None
+            
+        self.metrics_history[t] = {
+            'sinr_dB': -np.inf,
+            'capacity': 0.0,
+            'visible': visible,
+            'pr_dBm': pr_dBm,
+            'distance': d if visible else np.inf, 
+            'elevation_deg': elev_deg if visible else 0.0  
+        }
+
+    def calculate_sinr_and_interference(self, t, config):
+        if not self.metrics_history[t]['visible']:
+            return
+        pr_linear = 10 ** (self.metrics_history[t]['pr_dBm'] / 10.0)
+        sinr_linearno = pr_linear / config.noise_linear
+        self.metrics_history[t]['sinr_dB'] = 10 * np.log10(sinr_linearno)
+        self.metrics_history[t]['capacity'] = config.B * np.log2(1.0 + sinr_linearno)
+
+
+def handover_decision(t, idx, current_serving_id, satellites, config):    
+    current_sat = next((s for s in satellites if s.id == current_serving_id), None)
+    
+    if idx == 0 or current_serving_id == 0 or current_sat is None or not current_sat.metrics_history[t]['visible']:
+        visible_sats = [s for s in satellites if s.metrics_history[t]['visible'] and s.metrics_history[t]['sinr_dB'] != -np.inf] 
+        if not visible_sats:
+            return 0 
+        best_sat = max(visible_sats, key=lambda s: s.metrics_history[t]['sinr_dB']) 
+        return best_sat.id
+
+    current_sinr = current_sat.metrics_history[t]['sinr_dB']
+
+    for sat in satellites:
+        if not sat.metrics_history[t]['visible'] or sat.metrics_history[t]['sinr_dB'] == -np.inf:
+            continue
+        if sat.id == current_serving_id: 
+            continue
+
+        threshold = (current_sinr + config.H_dB) if config.use_hysteresis else current_sinr
+        if sat.metrics_history[t]['sinr_dB'] > threshold:
+            return sat.id
+              
+    return current_serving_id
+
+
+def run_single_simulation(hysteresis_value):
+    cfg = SimulationConfig(hysteresis_dB=hysteresis_value)
+    user = User(angle_rad=0.0, radius=cfg.Re)
+    
+    satellites = [] 
+    for i in range(1, cfg.N + 1):
+        theta0 = 2 * np.pi * (i - 1) / cfg.N
+        satellites.append(Satellite(sat_id=i, initial_theta=theta0))
+        
+    time_steps = []
+    current_time = 0.0 
+    while current_time <= cfg.T_orbite * 0.5: 
+        time_steps.append(current_time)
+        current_time += cfg.dt
+
+    for t in time_steps:
+        user.position_history[t] = (user.x, user.y)
+        for sat in satellites:
+            sat.update_position_and_metrics(t, cfg, user) 
+            sat.calculate_sinr_and_interference(t, cfg)
+
+    current_serving_id = 0
+    handover_count = 0
+    outage_points = 0
+    capacity_accumulator = []
+    delay_accumulator = []
+    
+    session_lengths = []
+    current_session_steps = 0
+
+    for idx, t in enumerate(time_steps):
+        prev_serving_id = current_serving_id
+        current_serving_id = handover_decision(t, idx, current_serving_id, satellites, cfg)
+        
+        is_handover_event = False
+        if idx > 0 and current_serving_id != prev_serving_id and prev_serving_id != 0 and current_serving_id != 0:
+            handover_count += 1
+            is_handover_event = True
+
+        if current_serving_id == 0:
+            outage_points += 1
+            capacity_accumulator.append(0.0)
+            if current_session_steps > 0:
+                session_lengths.append(current_session_steps * cfg.dt)
+            current_session_steps = 0
+        else:
+            active_sat = next(s for s in satellites if s.id == current_serving_id) 
+            sat_data = active_sat.metrics_history[t]
+            
+            if current_serving_id == prev_serving_id:
+                current_session_steps += 1
+            else:
+                if current_session_steps > 0:
+                    session_lengths.append(current_session_steps * cfg.dt)
+                current_session_steps = 1
+            
+            if sat_data['sinr_dB'] < cfg.gamma_th_dB:
+                outage_points += 1
+                capacity_accumulator.append(0.0)
+            else:
+                capacity_accumulator.append(sat_data['capacity'] / 1e6) 
+                
+                prop_delay_ms = (2 * sat_data['distance'] / cfg.c) * 1000 
+                ho_delay_ms = (cfg.handover_penalty_seconds * 1000) if is_handover_event else 0.0
+                total_delay_ms = prop_delay_ms + ho_delay_ms
+                delay_accumulator.append(total_delay_ms)
+
+    if current_session_steps > 0:
+        session_lengths.append(current_session_steps * cfg.dt)
+
+    outage_prob = (outage_points / len(time_steps)) * 100 
+    avg_capacity = np.mean(capacity_accumulator)
+    avg_delay = np.mean(delay_accumulator) if delay_accumulator else 0.0
+    max_delay = np.max(delay_accumulator) if delay_accumulator else 0.0
+    avg_session_time = np.mean(session_lengths) if session_lengths else 0.0
+    
+    return handover_count, outage_prob, avg_capacity, avg_delay, max_delay, avg_session_time
+
+
+def plot_all_sequential_analysis():
+    hysteresis_axes = np.arange(0.0, 6.5, 0.5)
+    
+    list_total_handovers = []
+    list_outage_probabilities = []
+    list_average_capacities = []
+    list_average_delays = []
+    list_max_delays = []
+    list_average_sessions = []
+
+    for h in hysteresis_axes:
+        print(f"Računam performanse sistema za H = {h:.1f} dB...")
+        ho, out_p, cap, delay, m_delay, session = run_single_simulation(h)
+        
+        list_total_handovers.append(ho)
+        list_outage_probabilities.append(out_p)
+        list_average_capacities.append(cap)
+        list_average_delays.append(delay)
+        list_max_delays.append(m_delay)
+        list_average_sessions.append(session)
+
+    print("\nSimulacije završene. Prikazujem grafike pojedinačno...")
+
+    # 1. GRAFIK: Broj hendovera
+    plt.figure(figsize=(7, 5))
+    plt.plot(hysteresis_axes, list_total_handovers, 'o-', color='purple', linewidth=2, markersize=7)
+    plt.xlabel('Histerezis H [dB]')
+    plt.ylabel('Broj hendovera')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+    # 2. GRAFIK: Prosečan kapacitet
+    plt.figure(figsize=(7, 5))
+    plt.plot(hysteresis_axes, list_average_capacities, 'o-', color='green', linewidth=2, markersize=7)
+    plt.xlabel('Histerezis H [dB]')
+    plt.ylabel('Prosečan kapacitet [Mbps]')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+    # 3. GRAFIK: Verovatnoća otkaza
+    plt.figure(figsize=(7, 5))
+    plt.plot(hysteresis_axes, list_outage_probabilities, 'o-', color='red', linewidth=2, markersize=7)
+    plt.xlabel('Histerezis H [dB]')
+    plt.ylabel('Verovatnoća otkaza [%]')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+    # 4. GRAFIK: Prosecno kasnjenje
+    plt.figure(figsize=(7, 5))
+    plt.plot(hysteresis_axes, list_average_delays, 'o-', color='blue', linewidth=2, markersize=7)
+    plt.xlabel('Histerezis H [dB]')
+    plt.ylabel('Prosecno kasnjenje [ms]')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+    # 5. NEW GRAFIK: Maksimalno kašnjenje
+    plt.figure(figsize=(7, 5))
+    plt.plot(hysteresis_axes, list_max_delays, 'o-', color='crimson', linewidth=2, markersize=7)
+    plt.xlabel('Histerezis H [dB]')
+    plt.ylabel('Maksimalno kasnjenje [ms]')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+    # 6. GRAFIK: Prosečno trajanje veze sa satelitom
+    plt.figure(figsize=(7, 5))
+    plt.plot(hysteresis_axes, list_average_sessions, 'o-', color='darkorange', linewidth=2, markersize=7)
+    plt.xlabel('Histerezis H [dB]')
+    plt.ylabel('Prosečno trajanje veze sa satelitom [s]')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+if __name__ == '__main__':
+    plot_all_sequential_analysis()

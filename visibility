@@ -1,0 +1,109 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+class SimulationConfig:
+    def __init__(self, h_custom, elev_min_custom):
+        self.N = 35                                 
+        self.elev_min_deg = elev_min_custom    
+        self.Re = 6371e3            
+        self.h = h_custom           
+        self.r_orbit = self.Re + self.h
+        self.konstanta_mi = 3.986e14
+        self.dt = 1.0  # Ubrzan korak za trenutni proračun
+
+    @property
+    def omega(self):
+        return np.sqrt(self.konstanta_mi / (self.r_orbit ** 3))
+
+    @property
+    def T_orbite(self): 
+        return 2 * np.pi / self.omega
+
+class User:
+    def __init__(self, radius=6371e3):
+        self.x = radius * np.cos(0.0)
+        self.y = radius * np.sin(0.0)
+        self.ux = self.x / radius
+        self.uy = self.y / radius
+
+class Satellite:
+    def __init__(self, initial_theta):
+        self.initial_theta = initial_theta
+
+    def is_visible(self, t, config, user): 
+        theta_orbit = self.initial_theta + config.omega * t
+        xs = config.r_orbit * np.cos(theta_orbit)
+        ys = config.r_orbit * np.sin(theta_orbit)
+        
+        dx = xs - user.x
+        dy = ys - user.y
+        d = np.sqrt(dx**2 + dy**2)
+        
+        elev_rad = np.arcsin((dx * user.ux + dy * user.uy) / d)
+        elev_deg = np.degrees(elev_rad)
+        
+        return elev_deg >= config.elev_min_deg
+
+def izracunaj_max_vidljivost(h_trenutna, elev_min):
+    cfg = SimulationConfig(h_custom=h_trenutna, elev_min_custom=elev_min)
+    user = User(radius=cfg.Re)
+    
+    satellites = [] 
+    for i in range(1, cfg.N + 1):
+        theta0 = 2 * np.pi * (i - 1) / cfg.N
+        satellites.append(Satellite(initial_theta=theta0))
+        
+    time_steps = []
+    current_time = 0.0 
+    while current_time <= cfg.T_orbite:
+        time_steps.append(current_time)    
+        current_time += cfg.dt
+
+    max_vidljivih = 0
+
+    for t in time_steps:
+        trenutno_vidljivi = 0
+        for sat in satellites:
+            if sat.is_visible(t, cfg, user):
+                trenutno_vidljivi += 1
+                
+        if trenutno_vidljivi > max_vidljivih:
+            max_vidljivih = trenutno_vidljivi
+
+    return max_vidljivih
+
+if __name__ == '__main__':
+    # Opseg visina od 300 do 1200 km sa korakom 100
+    visine_test_m = np.arange(300e3, 1300e3, 100e3)
+    visine_km = visine_test_m / 1e3
+    
+    max_sats_10 = []
+    max_sats_20 = []
+    
+    print("Računam maksimalan broj vidljivih satelita...")
+    
+    for h in visine_test_m:
+        max_sats_10.append(izracunaj_max_vidljivost(h, 10.0))
+        max_sats_20.append(izracunaj_max_vidljivost(h, 20.0))
+        
+    print("Generišem grafikon...")
+    
+    # Kreiranje grafikona
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(visine_km, max_sats_10, 'g-o', linewidth=2, label='Minimalna elevacija = 10°')
+    ax.plot(visine_km, max_sats_20, 'm--x', linewidth=2, label='Minimalna elevacija = 20°')
+    
+    ax.set_xlabel('Visina orbite h [km]')
+    ax.set_ylabel('Maksimalan broj vidljivih satelita')
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend()
+    
+    # Podešavanje Y ose da prikazuje samo cele brojeve (pošto su sateliti celi brojevi)
+    sve_vrednosti = max_sats_10 + max_sats_20
+    ax.set_yticks(range(min(sve_vrednosti), max(sve_vrednosti) + 2))
+    
+    plt.tight_layout()
+    plt.savefig('vidljivost_komparacija.png')
+    plt.close(fig)
+    
+    print("Grafikon 'vidljivost_komparacija.png' je uspešno sačuvan u folderu!")
