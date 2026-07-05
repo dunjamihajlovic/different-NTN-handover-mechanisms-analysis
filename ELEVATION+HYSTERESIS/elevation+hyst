@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 class SimulationConfig: 
-    def __init__(self, ho_strategy='SNR', num_satellites=35, hysteresis_dB=0.0):
+    def __init__(self, ho_strategy='SNR', num_satellites=25, hysteresis_dB=5.0):
         self.calculate_interference = False 
         self.moving_user = False  
         self.ho_strategy = ho_strategy
@@ -76,7 +76,25 @@ class Satellite:
         self.positions_history = {}   
         self.prev_sf_LoS = None 
         self.prev_sf_NLoS = None
-
+    def get_3gpp_urban_parameters(self, elev_deg):
+        """
+        Vrednosti preuzete iz 3GPP TR 38.821 standarda za Dense Urban / Urban scenario
+        (S-band, f = 2 GHz) u zavisnosti od ugla elevacije.
+        Vraća: (Pr_LoS, sigma_LoS, sigma_NLoS, Clutter_Loss_dB)
+        """
+        if elev_deg <= 15.0:
+            return 0.218, 2.87, 8.2, 31.1
+        elif elev_deg <= 25.0:
+            return 0.334, 2.71, 7.6, 29.5
+        elif elev_deg <= 35.0:
+            return 0.462, 2.45, 7.1, 27.3
+        elif elev_deg <= 45.0:
+            return 0.589, 2.12, 6.7, 25.0
+        elif elev_deg <= 55.0:
+            return 0.704, 1.76, 6.3, 22.5
+        else: # Za elevacije preko 55 stepeni (ka zenitu)
+            return 0.885, 1.10, 5.5, 18.0
+        
     def get_3gpp_rural_parameters(self, elev_deg):
         if elev_deg <= 15.0:
             return 0.782, 1.14, 9.7, 18.2
@@ -102,31 +120,35 @@ class Satellite:
         if elev_deg >= config.elev_min_deg:
             visible = True
             fspl_dB = 20 * np.log10(4 * np.pi * d * config.fc / config.c) 
-            pr_los, sigma_los, sigma_nlos, cl_dB = self.get_3gpp_rural_parameters(elev_deg)
+          
+            b = -4.7943*10**(-8) * elev_deg**3 + 5.5784*10**(-6) * elev_deg**2 - 2.1344*10**(-4) * elev_deg + 3.2710*10**(-2)
+            m = 6.3739*10**(-5) * elev_deg**3 + 5.8533*10**(-4) * elev_deg**2 - 1.5973*10**(-1) * elev_deg + 3.5156
+            om = 1.4428*10**(-5) * elev_deg**3 - 2.3798*10**(-3) * elev_deg**2 + 1.2702*10**(-1) * elev_deg - 1.4864
             
-            novi_sum_los = np.random.normal(0, sigma_los)
-            novi_sum_nlos = np.random.normal(0, sigma_nlos)
+            b = np.maximum(b, 0.00001) # 1e-6 
+            m = np.maximum(m, 0.00001)
+            om = np.maximum(om, 0.00001)
             
-            rho = 0.98
-            if self.prev_sf_LoS is None or self.prev_sf_NLoS is None:
-                sf_los = novi_sum_los
-                sf_nlos = novi_sum_nlos
-            else:
-                sf_los = rho * self.prev_sf_LoS + np.sqrt(1 - rho**2) * novi_sum_los
-                sf_nlos = rho * self.prev_sf_NLoS + np.sqrt(1 - rho**2) * novi_sum_nlos
-                
-            self.prev_sf_LoS = sf_los
-            self.prev_sf_NLoS = sf_nlos
+            sigr = np.sqrt(b)
             
-            PL_LoS = sf_los + fspl_dB
-            PL_NLoS = sf_nlos + cl_dB + fspl_dB
-            PL_tot = pr_los * PL_LoS + (1.0 - pr_los) * PL_NLoS
-            pr_dBm = config.Pt_dBm + config.Gt_dBi + config.Gr_max_dBi - PL_tot - config.La
+            # h1: multipath komponenta (N=1)
+            h1 = sigr * (np.random.randn() + 1j * np.random.randn())  # Generisanje 25 uzoraka za multipath komponentu
+            # h2: direktna komponenta (N=1)
+            h2 = np.sqrt(np.random.gamma(shape=m, scale=om/m))
+            
+            # Kompleksno pojačanje kanala
+            h = h1 + h2
+            
+            # Intenzitet kanala i teorijska srednja snaga za normalizaciju
+            h_intensity = np.abs(h)**2
+            mean_power = 2 * b + om
+            fading_dB = 10 * np.log10(h_intensity / mean_power)
+            
+            # Proračun snage signala na prijemu
+            pr_dBm = config.Pt_dBm + config.Gt_dBi + config.Gr_max_dBi - fspl_dB + fading_dB - config.La
         else:
             visible = False
             pr_dBm = -np.inf
-            self.prev_sf_LoS = None
-            self.prev_sf_NLoS = None
             
         self.metrics_history[t] = {
             'sinr_dB': -np.inf,
@@ -287,7 +309,7 @@ def generate_comparative_plots():
         h_0_metrics['adel'].append(adel); h_0_metrics['mdel'].append(mdel); h_0_metrics['sess'].append(sess)
         
         # 3. SNR sa H = 3.0 dB
-        ho, out, cap, adel, mdel, sess = run_core_simulation('SNR', n_sats, hysteresis_value=3.0)
+        ho, out, cap, adel, mdel, sess = run_core_simulation('SNR', n_sats, hysteresis_value=5.0)
         h_3_metrics['ho'].append(ho); h_3_metrics['out'].append(out); h_3_metrics['cap'].append(cap)
         h_3_metrics['adel'].append(adel); h_3_metrics['mdel'].append(mdel); h_3_metrics['sess'].append(sess)
         
@@ -301,12 +323,12 @@ def generate_comparative_plots():
     
     # Stilovi linija
     snr0_style = dict(marker='o', color='crimson', linewidth=2, label='SNR (H = 0 dB)')
-    snr3_style = dict(marker='s', color='purple', linewidth=2, label='SNR (H = 3 dB)')
+    snr5_style = dict(marker='s', color='purple', linewidth=2, label='SNR (H = 5 dB)')
     elev_style = dict(marker='x', color='darkorange', linestyle='--', linewidth=2, label='Elevation-based (off = 2°)')
 
     # 1. Broj Hendovera
     axs[0, 0].plot(satellite_density_range, h_0_metrics['ho'], **snr0_style)
-    axs[0, 0].plot(satellite_density_range, h_3_metrics['ho'], **snr3_style)
+    axs[0, 0].plot(satellite_density_range, h_3_metrics['ho'], **snr5_style)
     axs[0, 0].plot(satellite_density_range, el_metrics['ho'], **elev_style)
     axs[0, 0].set_ylabel('Ukupan broj hendovera')
     axs[0, 0].grid(True, linestyle=':', alpha=0.6)
@@ -315,7 +337,7 @@ def generate_comparative_plots():
 
     # 2. Prosečan kapacitet
     axs[0, 1].plot(satellite_density_range, h_0_metrics['cap'], **snr0_style)
-    axs[0, 1].plot(satellite_density_range, h_3_metrics['cap'], **snr3_style)
+    axs[0, 1].plot(satellite_density_range, h_3_metrics['cap'], **snr5_style)
     axs[0, 1].plot(satellite_density_range, el_metrics['cap'], **elev_style)
     axs[0, 1].set_ylabel('Prosečan kapacitet [Mbps]')
     axs[0, 1].grid(True, linestyle=':', alpha=0.6)
@@ -325,7 +347,7 @@ def generate_comparative_plots():
     # 3. Verovatnoća otkaza
     axs[1, 0].plot(satellite_density_range, h_0_metrics['out'], **snr0_style)
 
-    axs[1, 0].plot(satellite_density_range, h_3_metrics['out'], **snr3_style)
+    axs[1, 0].plot(satellite_density_range, h_3_metrics['out'], **snr5_style)
     axs[1, 0].plot(satellite_density_range, el_metrics['out'], **elev_style)
     axs[1, 0].set_ylabel('Verovatnoća otkaza [%]')
     axs[1, 0].grid(True, linestyle=':', alpha=0.6)
@@ -334,7 +356,7 @@ def generate_comparative_plots():
 
     # 4. Prosečno kašnjenje
     axs[1, 1].plot(satellite_density_range, h_0_metrics['adel'], **snr0_style)
-    axs[1, 1].plot(satellite_density_range, h_3_metrics['adel'], **snr3_style)
+    axs[1, 1].plot(satellite_density_range, h_3_metrics['adel'], **snr5_style)
     axs[1, 1].plot(satellite_density_range, el_metrics['adel'], **elev_style)
     axs[1, 1].set_ylabel('Prosečno kašnjenje [ms]')
     axs[1, 1].grid(True, linestyle=':', alpha=0.6)
@@ -343,7 +365,7 @@ def generate_comparative_plots():
 
     # 5. Maksimalno kašnjenje
     axs[2, 0].plot(satellite_density_range, h_0_metrics['mdel'], **snr0_style)
-    axs[2, 0].plot(satellite_density_range, h_3_metrics['mdel'], **snr3_style)
+    axs[2, 0].plot(satellite_density_range, h_3_metrics['mdel'], **snr5_style)
     axs[2, 0].plot(satellite_density_range, el_metrics['mdel'], **elev_style)
     axs[2, 0].set_xlabel('Ukupan broj satelita (N)')
     axs[2, 0].set_ylabel('Maksimalno kašnjenje [ms]')
@@ -353,7 +375,7 @@ def generate_comparative_plots():
 
     # 6. Prosečno trajanje veze (Session Time)
     axs[2, 1].plot(satellite_density_range, h_0_metrics['sess'], **snr0_style)
-    axs[2, 1].plot(satellite_density_range, h_3_metrics['sess'], **snr3_style)
+    axs[2, 1].plot(satellite_density_range, h_3_metrics['sess'], **snr5_style)
     axs[2, 1].plot(satellite_density_range, el_metrics['sess'], **elev_style)
     axs[2, 1].set_xlabel('Ukupan broj satelita (N)')
     axs[2, 1].set_ylabel('Trajanje veze sa satelitom [s]')

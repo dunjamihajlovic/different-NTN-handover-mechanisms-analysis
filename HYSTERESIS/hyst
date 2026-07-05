@@ -13,7 +13,7 @@ class SimulationConfig:
         self.gamma_th_dB = 3.0     # Outage prag [dB]
 
         # Geometrija i orbita
-        self.N = 35                 
+        self.N = 25                 
         self.elev_min_deg = 10.0    
         self.Re = 6371e3            
         self.h = 600e3              
@@ -25,7 +25,7 @@ class SimulationConfig:
         
         # Link Budget
         self.fc = 2e9               
-        self.c = 3e8                                
+        self.c = 3e8                                                
         self.lambda_ = self.c / self.fc
         self.Pt_dBm = 35.0          
         self.Gt_dBi = 26.0          
@@ -70,16 +70,6 @@ class Satellite:
         self.initial_theta = initial_theta
         self.metrics_history = {}     
         self.positions_history = {}   
-        self.prev_sf_LoS = None 
-        self.prev_sf_NLoS = None
-
-    def get_3gpp_rural_parameters(self, elev_deg):
-        if elev_deg <= 15.0:
-            return 0.782, 1.14, 9.7, 18.2
-        elif elev_deg <= 25.0:
-            return 0.861, 0.92, 8.8, 15.9
-        else:
-            return 0.950, 0.72, 7.5, 0.0
 
     def update_position_and_metrics(self, t, config, user): 
         theta_orbit = self.initial_theta + config.omega * t
@@ -98,31 +88,35 @@ class Satellite:
         if elev_deg >= config.elev_min_deg:
             visible = True
             fspl_dB = 20 * np.log10(4 * np.pi * d * config.fc / config.c) 
-            pr_los, sigma_los, sigma_nlos, cl_dB = self.get_3gpp_rural_parameters(elev_deg)
+          
+            b = -4.7943*10**(-8) * elev_deg**3 + 5.5784*10**(-6) * elev_deg**2 - 2.1344*10**(-4) * elev_deg + 3.2710*10**(-2)
+            m = 6.3739*10**(-5) * elev_deg**3 + 5.8533*10**(-4) * elev_deg**2 - 1.5973*10**(-1) * elev_deg + 3.5156
+            om = 1.4428*10**(-5) * elev_deg**3 - 2.3798*10**(-3) * elev_deg**2 + 1.2702*10**(-1) * elev_deg - 1.4864
             
-            novi_sum_los = np.random.normal(0, sigma_los)
-            novi_sum_nlos = np.random.normal(0, sigma_nlos)
+            b = np.maximum(b, 0.0001) # za numeričku stabilnost od niskih uglova elevacije tj za b < 0
+            m = np.maximum(m, 0.0001)
+            om = np.maximum(om, 0.0001)    #
             
-            rho = 0.98
-            if self.prev_sf_LoS is None or self.prev_sf_NLoS is None:
-                sf_los = novi_sum_los
-                sf_nlos = novi_sum_nlos
-            else:
-                sf_los = rho * self.prev_sf_LoS + np.sqrt(1 - rho**2) * novi_sum_los
-                sf_nlos = rho * self.prev_sf_NLoS + np.sqrt(1 - rho**2) * novi_sum_nlos
-                
-            self.prev_sf_LoS = sf_los
-            self.prev_sf_NLoS = sf_nlos
+            sigr = np.sqrt(b)
             
-            PL_LoS = sf_los + fspl_dB
-            PL_NLoS = sf_nlos + cl_dB + fspl_dB
-            PL_tot = pr_los * PL_LoS + (1.0 - pr_los) * PL_NLoS
-            pr_dBm = config.Pt_dBm + config.Gt_dBi + config.Gr_max_dBi - PL_tot - config.La
+            # h1: multipath komponenta (N=1)
+            h1 = sigr * (np.random.randn() + 1j * np.random.randn())  # Generisanje 25 uzoraka za multipath komponentu
+            # h2: direktna komponenta (N=1)
+            h2 = np.sqrt(np.random.gamma(shape=m, scale=om/m))
+            
+            # Kompleksno pojačanje kanala
+            h = h1 + h2
+            
+            # Intenzitet kanala i teorijska srednja snaga za normalizaciju
+            h_intensity = np.abs(h)**2
+            mean_power = 2 * b + om
+            fading_dB = 10 * np.log10(h_intensity / mean_power)
+            
+            # Proračun snage signala na prijemu
+            pr_dBm = config.Pt_dBm + config.Gt_dBi + config.Gr_max_dBi - fspl_dB + fading_dB - config.La
         else:
             visible = False
             pr_dBm = -np.inf
-            self.prev_sf_LoS = None
-            self.prev_sf_NLoS = None
             
         self.metrics_history[t] = {
             'sinr_dB': -np.inf,
@@ -247,7 +241,7 @@ def run_single_simulation(hysteresis_value):
 
 
 def plot_all_sequential_analysis():
-    hysteresis_axes = np.arange(0.0, 6.5, 0.5)
+    hysteresis_axes = np.arange(0.0, 10, 0.5)
     
     list_total_handovers = []
     list_outage_probabilities = []
@@ -271,7 +265,7 @@ def plot_all_sequential_analysis():
 
     # 1. GRAFIK: Broj hendovera
     plt.figure(figsize=(7, 5))
-    plt.plot(hysteresis_axes, list_total_handovers, 'o-', color='purple', linewidth=2, markersize=7)
+    plt.plot(hysteresis_axes, list_total_handovers, 'o-', color='purple', linewidth=2, markersize=4)
     plt.xlabel('Histerezis H [dB]')
     plt.ylabel('Broj hendovera')
     plt.grid(True, linestyle='--', alpha=0.6)
@@ -279,7 +273,7 @@ def plot_all_sequential_analysis():
 
     # 2. GRAFIK: Prosečan kapacitet
     plt.figure(figsize=(7, 5))
-    plt.plot(hysteresis_axes, list_average_capacities, 'o-', color='green', linewidth=2, markersize=7)
+    plt.plot(hysteresis_axes, list_average_capacities, 'o-', color='green', linewidth=2, markersize=4)
     plt.xlabel('Histerezis H [dB]')
     plt.ylabel('Prosečan kapacitet [Mbps]')
     plt.grid(True, linestyle='--', alpha=0.6)
@@ -287,23 +281,23 @@ def plot_all_sequential_analysis():
 
     # 3. GRAFIK: Verovatnoća otkaza
     plt.figure(figsize=(7, 5))
-    plt.plot(hysteresis_axes, list_outage_probabilities, 'o-', color='red', linewidth=2, markersize=7)
+    plt.plot(hysteresis_axes, list_outage_probabilities, 'o-', color='red', linewidth=2, markersize=4)
     plt.xlabel('Histerezis H [dB]')
     plt.ylabel('Verovatnoća otkaza [%]')
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.show()
 
-    # 4. GRAFIK: Prosecno kasnjenje
+    # 4. GRAFIK: Prosečno kašnjenje
     plt.figure(figsize=(7, 5))
-    plt.plot(hysteresis_axes, list_average_delays, 'o-', color='blue', linewidth=2, markersize=7)
+    plt.plot(hysteresis_axes, list_average_delays, 'o-', color='blue', linewidth=2, markersize=4)
     plt.xlabel('Histerezis H [dB]')
     plt.ylabel('Prosecno kasnjenje [ms]')
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.show()
 
-    # 5. NEW GRAFIK: Maksimalno kašnjenje
+    # 5. GRAFIK: Maksimalno kašnjenje
     plt.figure(figsize=(7, 5))
-    plt.plot(hysteresis_axes, list_max_delays, 'o-', color='crimson', linewidth=2, markersize=7)
+    plt.plot(hysteresis_axes, list_max_delays, 'o-', color='crimson', linewidth=2, markersize=4)
     plt.xlabel('Histerezis H [dB]')
     plt.ylabel('Maksimalno kasnjenje [ms]')
     plt.grid(True, linestyle='--', alpha=0.6)
@@ -311,7 +305,7 @@ def plot_all_sequential_analysis():
 
     # 6. GRAFIK: Prosečno trajanje veze sa satelitom
     plt.figure(figsize=(7, 5))
-    plt.plot(hysteresis_axes, list_average_sessions, 'o-', color='darkorange', linewidth=2, markersize=7)
+    plt.plot(hysteresis_axes, list_average_sessions, 'o-', color='darkorange', linewidth=2, markersize=4)
     plt.xlabel('Histerezis H [dB]')
     plt.ylabel('Prosečno trajanje veze sa satelitom [s]')
     plt.grid(True, linestyle='--', alpha=0.6)
